@@ -1,0 +1,170 @@
+name: "R2 to GitHub"
+description: "Transfer files from Cloudflare R2 to GitHub repositories based on size or quantity strategy."
+author: "fscarmen2"
+inputs:
+  config_path:
+    description: "Path to the configuration YAML file."
+    required: true
+    default: "./config.yml"
+outputs:
+  result:
+    description: "Summary of the action's execution."
+
+runs:
+  using: composite
+  steps:
+    - name: Runing
+      run: |
+        echo "开始 R2 ---> GitHub 脚本"
+
+        # 读取配置文件内容并替换格式，确保冒号后有空格
+        CONFIG=$(sed 's/:/: /g; s/:[[:space:]]\+/: /g' "${{ inputs.config_path }}")
+
+        # 从配置文件中读取 Cloudflare R2 的相关参数
+        R2_ACCOUNT_ID=$(yq eval '.r2_account_id' <<< "$CONFIG")
+        R2_ACCESS_KEY_ID=$(yq eval '.r2_access_key_id' <<< "$CONFIG")
+        R2_SECRET_ACCESS_KEY=$(yq eval '.r2_secret_access_key' <<< "$CONFIG")
+        R2_BUCKET=$(yq eval '.r2_bucket' <<< "$CONFIG")
+        R2_DIR=$(yq eval '.r2_dir' <<< "$CONFIG")
+        STRATEGY=$(yq eval '.strategy' <<< "$CONFIG")
+        DELETE=$(yq eval '.delete' <<< "$CONFIG")
+        R2_ENDPOINT_URL=https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com
+
+
+        # 从配置文件中读取 GitHub 的相关参数
+        GITHUB_PAT=$(yq eval '.github_pat' <<< "$CONFIG")
+        GITHUB_REPO_PREFIX=$(yq eval '.github_repo_prefix' <<< "$CONFIG")
+        # 获取 GitHub 的仓库列表
+        GITHUB_REPO_LIST=($(yq eval '.gitlab_pats | keys | .[]' <<< "$CONFIG" | sed "s/^/${GITHUB_REPO_PREFIX}&/g"))
+        # 获取 GitHub 用户名
+        GITHUB_USERNAME=$(curl --silent --header "Authorization: Bearer $GITHUB_PAT" https://api.github.com/user | awk -F '"' '/"login":/{print $4}')
+
+        # 配置 AWS CLI 访问 Cloudflare R2 的凭据
+        aws configure set aws_access_key_id $R2_ACCESS_KEY_ID
+        aws configure set aws_secret_access_key $R2_SECRET_ACCESS_KEY
+        aws configure set region auto
+        aws configure set output json
+
+        # 获取 Cloudflare R2 中的所有文件列表
+        FILE_LIST=($(aws s3 ls --endpoint-url=${R2_ENDPOINT_URL} s3://${R2_BUCKET}/ --recursive | awk '{print $NF}'))
+
+        # 如果有文件需要处理
+        if [ "${#FILE_LIST[@]}" -gt 0 ]; then
+          # 检查策略是否直接指定了仓库
+          for j in ${GITHUB_REPO_LIST[@]}; do
+            grep -qw "${STRATEGY}" <<< "$j" && REPO_NAME="${STRATEGY}" && break
+          done
+
+          # 如果策略直接指定了仓库
+          if [ -n "$REPO_NAME" ]; then
+            STRATEGY_RESULT="策略: 指定存放到 ${REPO_NAME}"
+          # 如果策略是基于文件数量的最少策略
+          elif [ "${STRATEGY,,}" = 'quantity' ]; then
+            MIN_INDEX=0
+            MIN_FILE_QUANTITY=$(curl --silent \
+            --header "Authorization: token ${GITHUB_PAT}" \
+            --header "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[0]}/contents/${R2_DIR} | grep -c '"name"')
+
+            # 遍历仓库，找到文件数量最少的仓库
+            for ((i=1; i<${#GITHUB_REPO_LIST[@]}; i++)); do
+              REPO_FILE_QUANTITY[i]=$(curl --silent \
+              --header "Authorization: token ${GITHUB_PAT}" \
+              --header "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[i]}/contents/${R2_DIR} | grep -c '"name"')
+              if [[ "$MIN_FILE_QUANTITY" -gt "${REPO_FILE_QUANTITY[i]}" ]]; then
+                MIN_FILE_QUANTITY="${REPO_FILE_QUANTITY[i]}"
+                MIN_INDEX="$i"
+              fi
+            done
+            REPO_NAME=${GITHUB_REPO_LIST[MIN_INDEX]}
+            STRATEGY_RESULT="策略: 存放到文件数量最少的 ${REPO_NAME}"
+          else
+            # 如果策略是基于仓库大小的最小策略
+            grep -qwE 'size|quantity' <<< "${STRATEGY,,}" || echo "Strategy 现在 [${STRATEGY}] 不可用， 将采用默认策略 size，可选项是 [size|quantity|$(sed 's/ /|/g' <<< "${GITHUB_REPO_LIST[@]}")]"
+            MIN_INDEX=0
+            MIN_REPO_SIZE=$(curl --silent \
+            --header "Authorization: token ${GITHUB_PAT}" \
+            --header "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[0]}/contents/${R2_DIR} | awk -F '[:,]' '/"size":/{print $2}' | awk '{s+=$1} END {print s}')
+
+            # 遍历仓库，找到容量最小的仓库
+            for ((i=1; i<${#GITHUB_REPO_LIST[@]}; i++)); do
+              REPO_SIZE[i]=$(curl --silent --header "Authorization: token ${GITHUB_PAT}" \
+              --header "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[i]}/contents/${R2_DIR} | awk -F '[:,]' '/"size":/{print $2}' | awk '{s+=$1} END {print s}')
+              if [[ "$MIN_REPO_SIZE" -gt "${REPO_SIZE[i]}" ]]; then
+                MIN_REPO_SIZE="${REPO_SIZE[i]}"
+                MIN_INDEX="$i"
+              fi
+            done
+            REPO_NAME=${GITHUB_REPO_LIST[MIN_INDEX]}
+            STRATEGY_RESULT="策略: 存放到仓库容量最少的 ${REPO_NAME}"
+          fi
+
+          # 克隆目标仓库
+          git clone --depth=1 https://${GITHUB_USERNAME}:${GITHUB_PAT}@github.com/${GITHUB_USERNAME}/${REPO_NAME}.git
+          cd ${REPO_NAME}
+
+          # 遍历文件列表，检查每个文件的大小
+          for k in "${FILE_LIST[@]}"; do
+            FILE_SIZE=$(aws s3api head-object \
+                --endpoint-url="${R2_ENDPOINT_URL}" \
+                --bucket "${R2_BUCKET}" \
+                --key "${k}" \
+                --query "ContentLength" \
+                --output text)
+            # 文件小于等于 100MB 的加入迁移列表
+            [ "${FILE_SIZE}" -le 104857600 ] && NEED_MOVE_FILE+=(${k}) || SKIP_FILE+=(${k})
+          done
+
+          # 将符合条件的文件下载到本地
+          [ "${#NEED_MOVE_FILE}" -gt 0 ] && echo "================================="
+          for l in "${NEED_MOVE_FILE[@]}"; do
+            (( m++ )) || true
+            echo "Copying ${m} / ${#NEED_MOVE_FILE[@]} : ${l#*/}"
+            aws s3 cp --endpoint-url=${R2_ENDPOINT_URL} s3://${R2_BUCKET}/${l} ${l} >/dev/null
+            DELETE_FILE+=("--include \"${l}\"")
+          done
+
+          # 提交更改到 GitHub
+          git config --global user.name 'github-actions'
+          git config --global user.email 'github-actions@github.com'
+          git add .
+          git commit -m "Add images from Cloudflare R2" || echo "No changes to commit"
+          git push -f || echo "No changes to push"
+          SUCCESS_UPDATE=$?
+          cd ..
+          rm -rf ${REPO_NAME}
+
+          if [ "${SUCCESS_UPDATE}" = 0 ]; then
+            # 删除已经迁移的文件
+            if [ "${DELETE,,}" = 'true' ]; then
+              COPY_OR_MOVE='迁移'
+              echo "Delete files from CloudFlare R2"
+              aws s3 rm --endpoint-url=${R2_ENDPOINT_URL} s3://${R2_BUCKET} --recursive --exclude "*" $(eval echo "${DELETE_FILE[@]}")
+            else
+              COPY_OR_MOVE='复制'
+            fi
+
+            # 打印总结
+            echo "================================="
+            echo "总结:"
+            echo "${STRATEGY_RESULT}"
+            echo "已成功${COPY_OR_MOVE} CloudFlare R2 ${#NEED_MOVE_FILE[@]} 个文件 ---> ${REPO_NAME}"
+            if [ "${#SKIP_FILE[@]}" -gt 0 ]; then
+              [ "${#SKIP_FILE[@]}" = 1 ] && echo "1 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，是 ${SKIP_FILE[@]}" || echo "${#SKIP_FILE[@]} 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，分别是 ${SKIP_FILE[@]}"
+            fi
+          else
+            echo "================================="
+            echo "总结:"
+            echo "GitHub: ${REPO_NAME} 更新失败"
+          fi
+        else
+          # 如果没有文件需要处理
+          echo "================================="
+          echo "总结:"
+          echo "CloudFlare R2 没有更新文件."
+        fi
+
+      shell: bash
